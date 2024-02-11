@@ -1,0 +1,22 @@
+{{ template "global/base" .}}
+
+<body>
+{{ template "global/navbar" .}}
+
+<div class="container">
+    <h1>
+        {{ .Title }}
+    </h1>
+    
+    <ul type="1">
+        {{ range $key, $value := .Options }}
+        <li>
+            <a href="/ePaper/{{ $key }}">{{ $value }}</a>
+        </li>
+        {{ end }}
+    </ul>
+</div>
+
+    {{ template "global/footer" .}}
+    {{ template "global/js" .}}
+    

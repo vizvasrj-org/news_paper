@@ -1,0 +1,16 @@
+footer {
+    /* position: fixed; */
+    height: 100px;
+    bottom: 0;
+    width: 100%;
+}
+
+form > div > input {
+    width: "100%";
+}
+
+.dflex {
+    display: flex;
+    flex-direction: column;
+    padding: 15px;
+}
