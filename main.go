@@ -85,6 +85,18 @@ func main() {
 	// 	fmt.Println(err)
 	// 	return
 	// }
+	go func() {
+		for {
+			resp, err := http.Get("https://hindustan-epaper.onrender.com")
+			if err != nil {
+				log.Fatal(err)
+			}
+			resp.Body.Close()
+			log.Printf("HTTP request sent at")
+			time.Sleep(5 * time.Minute)
+		}
+
+	}()
 	r := gin.Default()
 	TemplateHttp(r)
 	r.GET("/", TemplateBasic())
