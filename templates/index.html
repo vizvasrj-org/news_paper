@@ -16,6 +16,10 @@
         }
         .subHead {
             margin-left: 20px;
+            border-radius: 7px;
+            background-color: #e3e3bd;
+            padding-left: 4px;
+            padding-right: 4px;
         }
         .orgLocation {
             font-weight: bold;
@@ -44,8 +48,10 @@
                             {{.EditionLocation}}
                             {{range .Edition}}
                             <div class="subHead">
-                                <a href="/ePaper/{{.EditionID}}">{{.EditionName}}</a>
+                                <a href="/images/{{.EditionID}}">{{.EditionName}}</a>
+                                <a href="/ePaper/{{.EditionID}}"><img width="14px" height="14px" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAACXBIWXMAAAsTAAALEwEAmpwYAAAAlklEQVR4nO2TMQqDQBBF300kxNoUQm7iaYRU3sFCsPECnijipvEWBuEXFjoYs1u5H16zO8yHPzPwmx5ARkCVIhrsqowRPYHC4CWsmqXHrjpgNqiEVbP0iAZ4i+gD9MYMetWcNpiAO9BsGDT6m/4dsgNSoF4ZtMANePvaolEmuUj15nVNnRonwBDqDpwIdmjzAaIBF4voC42gDOWl8f+YAAAAAElFTkSuQmCC" alt="download--v1"></a>
                             </div>
+
                             {{end}}
                         </div>
                     {{end}}

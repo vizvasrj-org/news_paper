@@ -25,10 +25,15 @@
         .seo {
             font-size: 8px;
         }
+        .download-btn {
+            
+        }
     </style>
     {{ template "global/navbar" .}}
 
     <div class="container">
+        <a class="download-btn" href="/ePaper/{{.EditionID}}">Download</a>
+
         <h1>
             {{ .Title }}
         </h1>
@@ -40,6 +45,8 @@
                 </div>
             {{end}}
         </ul>
+
+        <a class="download-btn" href="/ePaper/{{.EditionID}}">Download</a>
     </div>
     
 
