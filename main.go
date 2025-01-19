@@ -6,45 +6,77 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
-	"src/pkg/jsondata"
 	"strings"
+	"sync"
 	"time"
 
+	"src/pkg/jsondata"
+
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 	"github.com/signintech/gopdf"
 )
 
-func GetData(now string, edition string) ([]byte, error) {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", "https://epaper.livehindustan.com/Home/GetAllpages?editionid="+edition+"&editiondate="+now, nil)
+type Config struct {
+	BaseURL      string
+	MaxDownloads int
+}
+
+var config Config
+
+var httpClient *http.Client
+
+func init() {
+	config = Config{
+		BaseURL:      "https://epaper.livehindustan.com",
+		MaxDownloads: 5, // Adjustable max concurrency
+	}
+	// Create a new cookie jar
+	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return nil, err
+		panic(err)
+	}
+	// Initialize the HTTP Client with the cookie jar
+	httpClient = &http.Client{
+		Jar: jar,
+	}
+}
+
+func GetData(now string, edition string) ([]byte, error) {
+	url := fmt.Sprintf("%s/Home/GetAllpages?editionid=%s&editiondate=%s", config.BaseURL, edition, now)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create new request")
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0")
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	// req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("DNT", "1")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("Referer", "https://epaper.livehindustan.com/hazaribagh?eddate=11/02/2024")
-	req.Header.Set("Cookie", "GDPR_COOKIE_LAW_CONSENT=true; _coach_tour=done; AWSALB=aGpOinzOWkHt8bo+VNZfhRBknIuQBmps8ThGwznt6Q3zrbS7NVEIbdaFeutFP/S5KNW/BEkUWqs9yo4lKClj7GUtLZpoSD72bXHh3O+96q21u9ZCi91xnA4rBPk+; AWSALBCORS=aGpOinzOWkHt8bo+VNZfhRBknIuQBmps8ThGwznt6Q3zrbS7NVEIbdaFeutFP/S5KNW/BEkUWqs9yo4lKClj7GUtLZpoSD72bXHh3O+96q21u9ZCi91xnA4rBPk+; ASP.NET_SessionId=drkqjvrmnoadnqzminxunymo; ViewType=ViewType=3; type_of_plateform=2; subTokenStatus=EbJgK+kpqJeqiFW3OuYMuzpZQWq9qsCqVQzTS2fxAXe1h8URCLFYupf/v9YKcV5RuR6A9WWhTu372YKbjlycsQ==; PageIdBeforePaywallVisible=; theme=theme-day; Home=1; changeddate=11/02/2024; PageName=01%3A%20FRONT%20PAGE; homelocation=notset; PageId=; MainEditionId=1017; EditionId=1017; editionCode_=Hazaribagh; MainEdName=%E0%A4%B9%E0%A4%9C%E0%A4%BE%E0%A4%B0%E0%A5%80%E0%A4%AC%E0%A4%BE%E0%A4%97; mintMainEditionName=%E0%A4%B9%E0%A4%9C%E0%A4%BE%E0%A4%B0%E0%A5%80%E0%A4%AC%E0%A4%BE%E0%A4%97")
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	req.Header.Set("TE", "trailers")
-	resp, err := client.Do(req)
+
+	resp, err := httpClient.Do(req) // Use the single client
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "http request failed")
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.Errorf("HTTP request failed with status %d", resp.StatusCode)
+	}
+
 	bodyText, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read response body")
 	}
-	// fmt.Printf("%s\n", bodyText)
 	return bodyText, nil
 }
 
@@ -55,9 +87,8 @@ type Page struct {
 func GetImages(b []byte) ([]Page, error) {
 	var pages []Page
 	if err := json.Unmarshal(b, &pages); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to unmarshal JSON")
 	}
-
 	for _, page := range pages {
 		fmt.Println(page.HighResolution)
 	}
@@ -65,34 +96,14 @@ func GetImages(b []byte) ([]Page, error) {
 }
 
 func main() {
-	// data, err := GetData(now)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	return
-	// }
-	// images, err := GetImages(data)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	return
-	// }
-	// filenames, err := DownloadImages(images)
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	return
-	// }
-	// err = CreatePdf(filenames, "output.pdf")
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	return
-	// }
 	go func() {
 		for {
-			resp, err := http.Get("https://hindustan-epaper.onrender.com")
+			resp, err := http.Get("https://hindustan-epaper.onrender.com/health")
 			if err != nil {
 				log.Fatal(err)
 			}
 			resp.Body.Close()
-			log.Printf("HTTP request sent at")
+			log.Printf("Health check sent at %v", time.Now().Format(time.RFC3339))
 			time.Sleep(5 * time.Minute)
 		}
 
@@ -100,12 +111,17 @@ func main() {
 	r := gin.Default()
 	TemplateHttp(r)
 	r.GET("/", TemplateBasic())
+	r.GET("/images/:edition", TemplateImages())
+	r.GET("/health", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
 	r.Run(":8080")
 }
 
 func TemplateHttp(r *gin.Engine) {
 	files := []string{
 		"./templates/index.html",
+		"./templates/image.html",
 		"./templates/global/base.html",
 		"./templates/global/footer.html",
 		"./templates/global/js.html",
@@ -114,57 +130,71 @@ func TemplateHttp(r *gin.Engine) {
 	r.LoadHTMLFiles(files...)
 	r.StaticFS("/static", http.Dir("./static"))
 
+	// r.GET("ePaper/:edition", func(c *gin.Context) {
+	// 	now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
+	// 	edition := c.Param("edition")
+
+	// 	pdfPath, err := processEpaper(now, edition)
+	// 	if err != nil {
+	// 		c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
+	// 		return
+	// 	}
+
+	// 	c.FileAttachment(pdfPath, pdfPath)
+	// })
+
 	r.GET("ePaper/:edition", func(c *gin.Context) {
 		now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
+
 		edition := c.Param("edition")
-		fmt.Println(now, edition)
 
-		// date := c.Param("date")
-		data, err := GetData(now, edition)
+		pdfPath, err := processEpaper(now, edition)
 		if err != nil {
-			fmt.Println(err)
+			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
 			return
 		}
-		images, err := GetImages(data)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		fmt.Println("gentImage complete")
-		filenames, err := DownloadImages(images, edition, now)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		fmt.Println("download image complete")
 
-		filename := fmt.Sprintf("./%s-%s", edition, strings.Join(strings.Split(now, "/"), "-"))
-		outputName := fmt.Sprintf("%s.pdf", filename)
-		err = CreatePdf(filenames, outputName)
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		fmt.Println("create pdf complete complete")
-
-		c.FileAttachment(outputName, outputName)
-		fmt.Println("attached")
+		c.FileAttachment(pdfPath, pdfPath)
 	})
+}
 
+func processEpaper(now string, edition string) (string, error) {
+	data, err := GetData(now, edition)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get data")
+	}
+	images, err := GetImages(data)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to get images")
+	}
+
+	filenames, err := DownloadImages(images, edition, now)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to download images")
+	}
+
+	filename := fmt.Sprintf("./%s-%s", edition, strings.Join(strings.Split(now, "/"), "-"))
+	outputName := fmt.Sprintf("%s.pdf", filename)
+	err = CreatePdf(filenames, outputName)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to create PDF")
+	}
+
+	return outputName, nil
 }
 
 type TemplateData struct {
 	Title   string
 	Body    string
 	Options jsondata.AutoGenerated
+	Images  []string
 }
 
-type Config struct {
+type TemplateConfig struct {
 	TemplateData
 }
 
 func TemplateBasic() gin.HandlerFunc {
-	fmt.Println("adsadsa")
 	return func(c *gin.Context) {
 		var ag jsondata.AutoGenerated
 		err := json.Unmarshal([]byte(jsondata.JD), &ag)
@@ -172,7 +202,6 @@ func TemplateBasic() gin.HandlerFunc {
 			log.Fatal(err)
 		}
 
-		fmt.Println("hererere")
 		data := TemplateData{
 			Title:   "Hindustan Epaper download for today!",
 			Body:    "This is a test",
@@ -182,77 +211,145 @@ func TemplateBasic() gin.HandlerFunc {
 	}
 }
 
+var IMAGES = []string{}
+
+func TemplateImages() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
+		edition := c.Param("edition")
+
+		data, err := GetData(now, edition)
+		if err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
+			return
+		}
+		images, err := GetImages(data)
+		if err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
+			return
+		}
+
+		imagesString := []string{}
+		for _, image := range images {
+			dURL := editHighResolution(image.HighResolution)
+			imagesString = append(imagesString, dURL)
+
+		}
+
+		data2 := TemplateData{
+			// Title:   "Hindustan Epaper Images",
+			Body:    "Here are the images for today's ePaper",
+			Options: jsondata.AutoGenerated{}, // Adjust as needed
+			Images:  imagesString,
+		}
+		c.HTML(http.StatusOK, "image.html", data2)
+	}
+}
+
 // 1824 × 2958 pixels
 func CreatePdf(imgs []string, outputFileName string) error {
-	// if outputname of file exists then do not create this step
 	if _, err := os.Stat(outputFileName); err == nil {
 		fmt.Println("File exists")
 		return nil
 	}
 	pdf := gopdf.GoPdf{}
 	size := gopdf.Rect{}
-	// size.PointsToUnits(gopdf.Unit_IN)
 	size.W = 1030
 	size.H = 1680
-	// leftMargin := 50.0
-	// leftMarginPoints := leftMargin * 72.0 / 25.4 // Convert mm to points
 	pdf.Start(gopdf.Config{PageSize: size})
 	for _, imgPath := range imgs {
 		pdf.AddPage()
 		err := pdf.Image(imgPath, 2, 0, nil)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "failed to add image %s", imgPath)
 		}
 	}
 	return pdf.WritePdf(outputFileName)
 }
 
 func DownloadImages(pages []Page, editionNo, date string) ([]string, error) {
-	filenames := []string{}
-	for i, page := range pages {
-		// edit page.HighResolution and remove
-		// https://epsfs.hindustantimes.com/LH/2024/02/11/RANxPLMU/5_16/d60c92d0_16_mr.jpg
-		// filename := fmt.Sprintf("./%s-%s/page_%d.jpg", editionNo, strings.Join(strings.Split(date, "/"), "-"), i)
+	var wg sync.WaitGroup
+	var errChan = make(chan error, len(pages))
 
-		dir := fmt.Sprintf("./%s-%s", editionNo, strings.Join(strings.Split(date, "/"), "-"))
-		err := os.MkdirAll(dir, 0755)
-		if err != nil {
-			return nil, err
-		}
-
-		filename := fmt.Sprintf("%s/page_%d.jpg", dir, i)
-		filenames = append(filenames, filename)
-		if _, err := os.Stat(filename); err == nil {
-			fmt.Println("File exists already, skipping download")
-			continue
-		}
-		dURL := editHighResolution(page.HighResolution)
-		resp, err := http.Get(dURL)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		// file name is last part of the url
-		file, err := os.Create(filename)
-		if err != nil {
-			return nil, err
-		}
-		defer file.Close()
-
-		_, err = io.Copy(file, resp.Body)
-		if err != nil {
-			return nil, err
-		}
+	dir := fmt.Sprintf("./%s-%s", editionNo, strings.Join(strings.Split(date, "/"), "-"))
+	err := os.MkdirAll(dir, 0755)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create directory")
 	}
+
+	// Create a channel to act as a worker pool.
+	// Buffer the channel to the configured max concurrency
+	imageJobs := make(chan struct{}, config.MaxDownloads)
+
+	// Create a slice to store filenames with the same length as pages
+	filenames := make([]string, len(pages))
+
+	for i, page := range pages {
+		wg.Add(1)
+
+		go func(i int, page Page) {
+			fmt.Println("Downloading image", i)
+			defer wg.Done()
+
+			filename := fmt.Sprintf("%s/page_%d.jpg", dir, i)
+			filenames[i] = filename
+			if _, err := os.Stat(filename); err == nil {
+				fmt.Println("File exists already, skipping download")
+				return
+			}
+			dURL := editHighResolution(page.HighResolution)
+
+			// Send a job to the worker pool
+			imageJobs <- struct{}{}
+			err := downloadImage(dURL, filename)
+			// Signal to worker pool that the job is done
+			<-imageJobs
+
+			if err != nil {
+				errChan <- errors.Wrapf(err, "failed to download image %s", dURL)
+				return
+			}
+		}(i, page)
+	}
+	wg.Wait()
+	close(errChan)
+	var combinedErr error
+	for err := range errChan {
+		combinedErr = errors.Wrap(combinedErr, err.Error())
+	}
+	if combinedErr != nil {
+		return nil, combinedErr
+	}
+
 	return filenames, nil
 }
 
+func downloadImage(url string, filename string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get image from url %s", url)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("http request failed with status %d from url %s", resp.StatusCode, url)
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create file %s", filename)
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		return errors.Wrapf(err, "failed to write file %s", filename)
+	}
+	return nil
+}
+
 func editHighResolution(url string) string {
-	// Check if the URL has "_mr" in it
 	if strings.Contains(url, "_mr") {
-		// Replace "_mr" with an empty string
 		return strings.Replace(url, "_mr", "", -1)
 	}
-	// If the URL doesn't contain "_mr", return it as is
 	return url
 }

@@ -17,4 +17,5 @@ COPY . .
 RUN go build -o main .
 
 # Set the command to run the executable
+EXPOSE 8080
 CMD ["./main"]

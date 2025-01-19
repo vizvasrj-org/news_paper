@@ -1,0 +1,48 @@
+{{ template "global/base" .}}
+
+<body>
+    <style>
+        .redBG {
+            background-color: wheat;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: start;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+            margin-left: 20px;
+
+        }
+        .subHead {
+            margin-left: 20px;
+        }
+        .orgLocation {
+            font-weight: bold;
+            color: darkblue;
+            margin-bottom: 10px;
+        }
+        .seo {
+            font-size: 8px;
+        }
+    </style>
+    {{ template "global/navbar" .}}
+
+    <div class="container">
+        <h1>
+            {{ .Title }}
+        </h1>
+
+        <ul type="1">
+            {{range .Images}}
+                <div class="orgLocation">
+                    <img src="{{ . }}" alt="image">
+                </div>
+            {{end}}
+        </ul>
+    </div>
+    
+
+    {{ template "global/footer" .}}
+    {{ template "global/js" .}}
+</body>
