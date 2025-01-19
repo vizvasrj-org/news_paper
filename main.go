@@ -98,7 +98,7 @@ func GetImages(b []byte) ([]Page, error) {
 func main() {
 	go func() {
 		for {
-			resp, err := http.Get("https://hindustan-epaper.onrender.com/health")
+			resp, err := http.Get("https://h.sauravraj.dev/health")
 			if err != nil {
 				log.Fatal(err)
 			}
