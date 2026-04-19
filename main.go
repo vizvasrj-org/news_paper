@@ -98,9 +98,9 @@ func GetImages(b []byte) ([]Page, error) {
 func main() {
 	go func() {
 		for {
-			resp, err := http.Get("https://h.sauravraj.dev/health")
+			resp, err := http.Get("https://news-paper-ssa9.onrender.com/health")
 			if err != nil {
-				log.Fatal(err)
+				log.Println(err)
 			}
 			resp.Body.Close()
 			log.Printf("Health check sent at %v", time.Now().Format(time.RFC3339))
