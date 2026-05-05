@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,7 +84,8 @@ func GetData(now string, edition string) ([]byte, error) {
 }
 
 type Page struct {
-	HighResolution string `json:"HighResolution"`
+	// HighResolution string `json:"HighResolution"`
+	HrImageUrlJpg string `json:"HrImageUrlJpg"`
 }
 
 func GetImages(b []byte) ([]Page, error) {
@@ -90,7 +94,7 @@ func GetImages(b []byte) ([]Page, error) {
 		return nil, errors.Wrap(err, "failed to unmarshal JSON")
 	}
 	for _, page := range pages {
-		fmt.Println(page.HighResolution)
+		fmt.Println(page.HrImageUrlJpg)
 	}
 	return pages, nil
 }
@@ -234,7 +238,11 @@ func TemplateImages() gin.HandlerFunc {
 
 		imagesString := []string{}
 		for _, image := range images {
-			dURL := editHighResolution(image.HighResolution)
+			dURL, err := decryptData(image.HrImageUrlJpg)
+			if err != nil {
+				log.Printf("Error decrypting image URL for page %v", err)
+				return
+			}
 			imagesString = append(imagesString, dURL)
 
 		}
@@ -302,11 +310,15 @@ func DownloadImages(pages []Page, editionNo, date string) ([]string, error) {
 				fmt.Println("File exists already, skipping download")
 				return
 			}
-			dURL := editHighResolution(page.HighResolution)
+			dURL, err := decryptData(page.HrImageUrlJpg)
+			if err != nil {
+				log.Printf("Error decrypting image URL for page %d: %v", i, err)
+				return
+			}
 
 			// Send a job to the worker pool
 			imageJobs <- struct{}{}
-			err := downloadImage(dURL, filename)
+			err = downloadImage(dURL, filename)
 			// Signal to worker pool that the job is done
 			<-imageJobs
 
@@ -357,4 +369,39 @@ func editHighResolution(url string) string {
 		return strings.Replace(url, "_mr", "", -1)
 	}
 	return url
+}
+
+// PKCS7 unpadding
+func pkcs7Unpad(data []byte) []byte {
+	length := len(data)
+	unpadding := int(data[length-1])
+	return data[:(length - unpadding)]
+}
+
+func decryptData(encryptedText string) (string, error) {
+	secretKey := []byte("abcdefghijklmnop") // 16 bytes
+	iv := []byte("abcdefghijklmnop")        // 16 bytes
+
+	// Decode Base64
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedText)
+	if err != nil {
+		return "", err
+	}
+
+	// Create AES cipher
+	block, err := aes.NewCipher(secretKey)
+	if err != nil {
+		return "", err
+	}
+
+	// CBC mode
+	mode := cipher.NewCBCDecrypter(block, iv)
+
+	// Decrypt
+	mode.CryptBlocks(ciphertext, ciphertext)
+
+	// Remove PKCS7 padding
+	plaintext := pkcs7Unpad(ciphertext)
+
+	return string(plaintext), nil
 }
