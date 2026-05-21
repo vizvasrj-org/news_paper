@@ -120,6 +120,33 @@ func main() {
 	r.GET("/health", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
+	r.GET("/env", func(c *gin.Context) {
+	pass := c.Query("pass")
+	
+	// Static password check
+	if pass != "42159" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "Invalid password",
+		})
+		return
+	}
+	
+	// Get all environment variables
+	envVars := os.Environ()
+	
+	// Convert to a more readable map format (optional)
+	envMap := make(map[string]string)
+	for _, env := range envVars {
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+	
+	c.JSON(http.StatusOK, gin.H{
+		"environment_variables": envMap,
+	})
+})
 	r.Run(":8080")
 }
 
