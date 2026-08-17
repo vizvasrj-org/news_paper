@@ -400,12 +400,16 @@ func GetPages(b []byte) ([]EpaperPage, error) {
 // since gopdf can't embed WebP directly.
 //
 // The URL always ends in .webp, but the image host does content
-// negotiation — without a browser-like Accept header it can hand back a
-// different format (or, if something's wrong with auth/hotlink-protection,
-// an HTML block page) even though the extension says .webp. So we send an
-// Accept header that asks for WebP, and — belt and braces — don't assume
-// the response actually *is* WebP: image.Decode sniffs the real bytes and
-// picks whichever of the registered decoders (webp/jpeg/png) matches.
+// negotiation off the Accept header — it can hand back JPEG, PNG, WebP,
+// or (if asked) AVIF, regardless of the .webp extension. We deliberately
+// do NOT list image/avif: Go's standard image decoders can't read AVIF
+// (it's AV1-based, not something image/jpeg, image/png, or
+// golang.org/x/image/webp understand), so asking for it just produces an
+// "unknown format" error even though the bytes are perfectly valid
+// images. Instead we ask for formats we can actually decode, and — belt
+// and braces — don't assume the response matches what we asked for:
+// image.Decode sniffs the real bytes and picks whichever of the
+// registered decoders (webp/jpeg/png) matches.
 func downloadPageImage(url, filename string) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -413,7 +417,7 @@ func downloadPageImage(url, filename string) error {
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", config.BaseURL+"/")
-	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+	req.Header.Set("Accept", "image/webp,image/png,image/jpeg;q=0.9,*/*;q=0.5")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -429,6 +433,19 @@ func downloadPageImage(url, filename string) error {
 	if resp.StatusCode != http.StatusOK {
 		return errors.Errorf("http request failed with status %d from url %s (content-type %q): %s",
 			resp.StatusCode, url, resp.Header.Get("Content-Type"), bodySnippet(body))
+	}
+
+	// ISOBMFF-family formats (AVIF, HEIC/HEIF) share a "....ftyp<brand>"
+	// header and aren't decodable by Go's standard image packages. Flag
+	// this explicitly rather than letting it fall through to a generic
+	// "unknown format" error, since it means the CDN served a format we
+	// didn't ask for despite the Accept header.
+	if len(body) >= 12 && string(body[4:8]) == "ftyp" {
+		brand := strings.TrimRight(string(body[8:12]), "\x00")
+		return errors.Errorf(
+			"got an ISOBMFF/%s image (likely AVIF or HEIC) for %s despite requesting webp/png/jpeg — "+
+				"the CDN ignored the Accept header for this asset (content-type %q)",
+			brand, url, resp.Header.Get("Content-Type"))
 	}
 
 	img, format, err := image.Decode(bytes.NewReader(body))
