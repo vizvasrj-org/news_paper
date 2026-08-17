@@ -1,8 +1,125 @@
 {{ define "global/js" }}
-
 <script src="/static/js/bootstrap.bundle.min.js"></script>
 <script src="/static/js/jquery-3.6.3.js"></script>
+<script>
+(function () {
+    "use strict";
+
+    /* ---------- Footer year ---------- */
+    var yearEl = document.getElementById('year');
+    if (yearEl) yearEl.textContent = new Date().getFullYear();
+
+    /* ---------- Theme toggle ---------- */
+    var toggle = document.getElementById('themeToggle');
+    function applyIcon() {
+        if (!toggle) return;
+        var t = document.documentElement.getAttribute('data-theme');
+        toggle.textContent = t === 'dark' ? '☀️' : '🌙';
+    }
+    applyIcon();
+    if (toggle) {
+        toggle.addEventListener('click', function () {
+            var current = document.documentElement.getAttribute('data-theme');
+            var next = current === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            try { localStorage.setItem('hnd-theme', next); } catch (e) {}
+            applyIcon();
+        });
+    }
+
+    /* ---------- Homepage search filter ---------- */
+    var search = document.getElementById('citySearch');
+    if (search) {
+        var wrap = search.closest('.search-wrap');
+        var clearBtn = document.getElementById('searchClear');
+        var stateSections = Array.prototype.slice.call(document.querySelectorAll('.state-section'));
+        var noResults = document.getElementById('noResults');
+
+        function runFilter() {
+            var q = search.value.trim().toLowerCase();
+            if (wrap) wrap.classList.toggle('has-value', q.length > 0);
+            var anyVisible = false;
+
+            stateSections.forEach(function (section) {
+                var cityCards = section.querySelectorAll('.city-card');
+                var sectionHasMatch = false;
+                cityCards.forEach(function (card) {
+                    var match = q === '' || card.textContent.toLowerCase().indexOf(q) !== -1;
+                    card.style.display = match ? '' : 'none';
+                    if (match) sectionHasMatch = true;
+                });
+                section.style.display = sectionHasMatch ? '' : 'none';
+                if (sectionHasMatch) anyVisible = true;
+            });
+
+            if (noResults) noResults.style.display = anyVisible ? 'none' : 'block';
+        }
+
+        search.addEventListener('input', runFilter);
+        if (clearBtn) {
+            clearBtn.addEventListener('click', function () {
+                search.value = '';
+                runFilter();
+                search.focus();
+            });
+        }
+
+        var countEl = document.getElementById('editionCount');
+        if (countEl) countEl.textContent = document.querySelectorAll('.edition-chip').length;
+    }
+
+    /* ---------- Download button toast ---------- */
+    var toast = document.getElementById('toast');
+    document.querySelectorAll('.btn-download').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            if (!toast) return;
+            toast.classList.add('show');
+            setTimeout(function () { toast.classList.remove('show'); }, 6000);
+        });
+    });
+
+    /* ---------- Lightbox gallery (image.html) ---------- */
+    var cards = Array.prototype.slice.call(document.querySelectorAll('.page-card img'));
+    var lightbox = document.getElementById('lightbox');
+    if (cards.length && lightbox) {
+        var lbImg = document.getElementById('lightboxImg');
+        var counter = document.getElementById('lightboxCounter');
+        var idx = 0;
+
+        function show(i) {
+            idx = (i + cards.length) % cards.length;
+            lbImg.src = cards[idx].currentSrc || cards[idx].src;
+            if (counter) counter.textContent = (idx + 1) + ' / ' + cards.length;
+        }
+        function open(i) {
+            show(i);
+            lightbox.classList.add('open');
+            document.body.style.overflow = 'hidden';
+        }
+        function close() {
+            lightbox.classList.remove('open');
+            document.body.style.overflow = '';
+        }
+
+        cards.forEach(function (img, i) {
+            img.closest('.page-card').addEventListener('click', function () { open(i); });
+        });
+        var closeBtn = document.getElementById('lightboxClose');
+        var prevBtn = document.getElementById('lightboxPrev');
+        var nextBtn = document.getElementById('lightboxNext');
+        if (closeBtn) closeBtn.addEventListener('click', close);
+        if (prevBtn) prevBtn.addEventListener('click', function (e) { e.stopPropagation(); show(idx - 1); });
+        if (nextBtn) nextBtn.addEventListener('click', function (e) { e.stopPropagation(); show(idx + 1); });
+        lightbox.addEventListener('click', function (e) { if (e.target === lightbox) close(); });
+        document.addEventListener('keydown', function (e) {
+            if (!lightbox.classList.contains('open')) return;
+            if (e.key === 'Escape') close();
+            if (e.key === 'ArrowLeft') show(idx - 1);
+            if (e.key === 'ArrowRight') show(idx + 1);
+        });
+    }
+})();
+</script>
 </body>
 </html>
-
 {{ end }}
