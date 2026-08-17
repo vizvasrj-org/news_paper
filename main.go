@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg" // register JPEG decoding with image.Decode
 	"image/png"
 	"io"
 	"log"
@@ -21,7 +24,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"github.com/signintech/gopdf"
-	"golang.org/x/image/webp"
+	_ "golang.org/x/image/webp" // register WebP decoding with image.Decode
 )
 
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
@@ -393,8 +396,16 @@ func GetPages(b []byte) ([]EpaperPage, error) {
 // Image download + PDF assembly
 // =====================================================================
 
-// downloadPageImage downloads a page's viewerSrc (a .webp file) and
-// re-encodes it as PNG, since gopdf can't embed WebP directly.
+// downloadPageImage downloads a page's viewerSrc and re-encodes it as PNG,
+// since gopdf can't embed WebP directly.
+//
+// The URL always ends in .webp, but the image host does content
+// negotiation — without a browser-like Accept header it can hand back a
+// different format (or, if something's wrong with auth/hotlink-protection,
+// an HTML block page) even though the extension says .webp. So we send an
+// Accept header that asks for WebP, and — belt and braces — don't assume
+// the response actually *is* WebP: image.Decode sniffs the real bytes and
+// picks whichever of the registered decoders (webp/jpeg/png) matches.
 func downloadPageImage(url, filename string) error {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -402,20 +413,30 @@ func downloadPageImage(url, filename string) error {
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Referer", config.BaseURL+"/")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get image from url %s", url)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("http request failed with status %d from url %s", resp.StatusCode, url)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read image body from %s", url)
 	}
 
-	img, err := webp.Decode(resp.Body)
-	if err != nil {
-		return errors.Wrapf(err, "failed to decode webp image %s", url)
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("http request failed with status %d from url %s (content-type %q): %s",
+			resp.StatusCode, url, resp.Header.Get("Content-Type"), bodySnippet(body))
 	}
+
+	img, format, err := image.Decode(bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrapf(err, "failed to decode image %s (content-type %q, %d bytes, body starts %s)",
+			url, resp.Header.Get("Content-Type"), len(body), bodySnippet(body))
+	}
+	_ = format // "webp", "jpeg", or "png" — not needed beyond diagnostics
 
 	file, err := os.Create(filename)
 	if err != nil {
@@ -427,6 +448,17 @@ func downloadPageImage(url, filename string) error {
 		return errors.Wrapf(err, "failed to encode png %s", filename)
 	}
 	return nil
+}
+
+// bodySnippet returns a short, safely-printable preview of a response
+// body — enough to tell at a glance whether a failed download actually
+// came back as an HTML block/challenge page rather than image bytes.
+func bodySnippet(b []byte) string {
+	const max = 200
+	if len(b) > max {
+		b = b[:max]
+	}
+	return strconv.Quote(string(b))
 }
 
 func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
