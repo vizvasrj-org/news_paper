@@ -1,5 +1,5 @@
-# Use the official Golang image as the base image
-FROM golang:1.21.2
+# Use a Golang image whose Go version matches (or exceeds) the "go" line in go.mod
+FROM golang:1.25
 
 # Set the working directory inside the container
 WORKDIR /app
