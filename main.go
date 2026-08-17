@@ -1,16 +1,17 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"github.com/signintech/gopdf"
+	"golang.org/x/image/webp"
 )
+
+const userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
 type Config struct {
 	BaseURL      string
-	MaxDownloads int
+	LocationsURL string
+	MaxDownloads int // Adjustable max concurrency
 }
 
 var config Config
@@ -34,70 +39,477 @@ var httpClient *http.Client
 func init() {
 	config = Config{
 		BaseURL:      "https://epaper.livehindustan.com",
-		MaxDownloads: 5, // Adjustable max concurrency
+		LocationsURL: "https://epaperinhouse.livehindustan.com/be/api/v1/locations",
+		MaxDownloads: 5,
 	}
-	// Create a new cookie jar
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		panic(err)
 	}
-	// Initialize the HTTP Client with the cookie jar
 	httpClient = &http.Client{
-		Jar: jar,
+		Jar:     jar,
+		Timeout: 30 * time.Second,
 	}
 }
 
-func GetData(now string, edition string) ([]byte, error) {
-	url := fmt.Sprintf("%s/Home/GetAllpages?editionid=%s&editiondate=%s", config.BaseURL, edition, now)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create new request")
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("DNT", "1")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Referer", "https://epaper.livehindustan.com/hazaribagh?eddate=11/02/2024")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("TE", "trailers")
+// =====================================================================
+// New Next.js data-route response structures
+//
+// https://epaper.livehindustan.com/_next/data/{buildId}/edition/{slug}.json
+//   ?date=YYYY-MM-DD&page=1&city={slug}
+//
+// Unlike the old /Home/GetAllpages endpoint, ViewerSrc below is already a
+// plain, directly-downloadable URL — the AES-encrypted HrImageUrlJpg field
+// and the decryption step that used to unwrap it are both gone.
+// =====================================================================
 
-	resp, err := httpClient.Do(req) // Use the single client
+type NextPageData struct {
+	PageProps PageProps `json:"pageProps"`
+}
+
+type PageProps struct {
+	CityOptions   []CityOption `json:"cityOptions"`
+	Edition       EditionData  `json:"edition"`
+	InitialPage   int          `json:"initialPage"`
+	InitialSearch string       `json:"initialSearch"`
+}
+
+type CityOption struct {
+	Slug   string `json:"slug"`
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
+
+type EditionData struct {
+	City         City         `json:"city"`
+	IssueDateIso string       `json:"issueDateIso"`
+	IssueLabel   string       `json:"issueLabel"`
+	Pages        []EpaperPage `json:"pages"`
+	TotalPages   int          `json:"totalPages"`
+	EditionID    string       `json:"editionId"` // e.g. "RAN_HAZB"
+}
+
+type City struct {
+	Slug   string `json:"slug"`
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
+
+// EpaperPage is a single page of an edition.
+type EpaperPage struct {
+	ID           string `json:"id"`
+	PageNumber   int    `json:"pageNumber"`
+	Title        string `json:"title"`
+	ViewerSrc    string `json:"viewerSrc"` // full-resolution .webp, ready to download
+	ViewerWidth  int    `json:"viewerWidth"`
+	ViewerHeight int    `json:"viewerHeight"`
+	ThumbnailSrc string `json:"thumbnailSrc"`
+	Alt          string `json:"alt"`
+	IsJacket     bool   `json:"isJacket"`
+}
+
+// =====================================================================
+// /be/api/v1/locations structures — used only to map whatever edition
+// identifier the caller already has (old numeric EditionId, EditionCode
+// like "RAN_HAZB", ...) onto the slug the new API needs.
+// =====================================================================
+
+type LocationGroup struct {
+	ID              string            `json:"id"`
+	OrgLocation     string            `json:"orgLocation"`
+	LocationID      int               `json:"locationId"`
+	EditionLocation []EditionLocation `json:"editionlocation"`
+}
+
+type EditionLocation struct {
+	EditionLocation string        `json:"EditionLocation"`
+	Editions        []EditionInfo `json:"edition"`
+}
+
+type EditionInfo struct {
+	EditionName        string `json:"EditionName"`
+	EditionDisplayName string `json:"EditionDisplayName"`
+	EditionID          int    `json:"EditionId"`
+	EditionCode        string `json:"EditionCode"`
+}
+
+// Slug returns the URL slug the new /edition/{slug} route expects.
+// Empirically this is just the lowercased EditionName, e.g.
+// "Hazaribagh" -> "hazaribagh", "Lucknow-Nagar" -> "lucknow-nagar".
+// It isn't returned by the locations API itself, so we derive it here.
+func (e EditionInfo) Slug() string {
+	return strings.ToLower(strings.TrimSpace(e.EditionName))
+}
+
+func fetchLocations() ([]LocationGroup, error) {
+	req, err := http.NewRequest("GET", config.LocationsURL, nil)
 	if err != nil {
-		return nil, errors.Wrap(err, "http request failed")
+		return nil, errors.Wrap(err, "failed to create locations request")
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Referer", config.BaseURL+"/")
+	req.Header.Set("Origin", config.BaseURL)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, errors.Wrap(err, "locations request failed")
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("HTTP request failed with status %d", resp.StatusCode)
+		return nil, errors.Errorf("locations request failed with status %d", resp.StatusCode)
 	}
 
-	bodyText, err := io.ReadAll(resp.Body)
+	var groups []LocationGroup
+	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
+		return nil, errors.Wrap(err, "failed to decode locations response")
+	}
+	return groups, nil
+}
+
+// editionIndex is a small in-memory cache over fetchLocations so we don't
+// hit that endpoint on every request.
+type editionIndex struct {
+	mu      sync.RWMutex
+	bySlug  map[string]EditionInfo
+	byCode  map[string]EditionInfo
+	byID    map[string]EditionInfo
+	fetched time.Time
+}
+
+var editions = &editionIndex{}
+
+const editionIndexTTL = 6 * time.Hour
+
+func (idx *editionIndex) ensureFresh() error {
+	idx.mu.RLock()
+	stale := idx.bySlug == nil || time.Since(idx.fetched) > editionIndexTTL
+	idx.mu.RUnlock()
+	if !stale {
+		return nil
+	}
+
+	groups, err := fetchLocations()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to read response body")
+		return err
 	}
-	return bodyText, nil
+
+	bySlug := make(map[string]EditionInfo)
+	byCode := make(map[string]EditionInfo)
+	byID := make(map[string]EditionInfo)
+	for _, g := range groups {
+		for _, el := range g.EditionLocation {
+			for _, e := range el.Editions {
+				bySlug[e.Slug()] = e
+				byCode[e.EditionCode] = e
+				byID[strconv.Itoa(e.EditionID)] = e
+			}
+		}
+	}
+
+	idx.mu.Lock()
+	idx.bySlug, idx.byCode, idx.byID = bySlug, byCode, byID
+	idx.fetched = time.Now()
+	idx.mu.Unlock()
+	return nil
 }
 
-type Page struct {
-	// HighResolution string `json:"HighResolution"`
-	HrImageUrlJpg string `json:"HrImageUrlJpg"`
+// Resolve accepts whatever identifier a caller already has for an edition
+// — an old numeric EditionId, an EditionCode such as "RAN_HAZB", or an
+// already-correct slug — and returns the matching EditionInfo.
+func (idx *editionIndex) Resolve(input string) (EditionInfo, error) {
+	if err := idx.ensureFresh(); err != nil {
+		return EditionInfo{}, err
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	if e, ok := idx.bySlug[strings.ToLower(input)]; ok {
+		return e, nil
+	}
+	if e, ok := idx.byCode[input]; ok {
+		return e, nil
+	}
+	if e, ok := idx.byID[input]; ok {
+		return e, nil
+	}
+	return EditionInfo{}, errors.Errorf("unknown edition %q", input)
 }
 
-func GetImages(b []byte) ([]Page, error) {
-	var pages []Page
-	if err := json.Unmarshal(b, &pages); err != nil {
+// =====================================================================
+// Next.js buildId — part of the data-route URL and rotated on every
+// deploy, so it can't be hardcoded and has to be scraped off a live page.
+// =====================================================================
+
+var buildIDRe = regexp.MustCompile(`"buildId"\s*:\s*"([^"]+)"`)
+
+type buildIDCache struct {
+	mu      sync.RWMutex
+	id      string
+	fetched time.Time
+}
+
+var currentBuildID = &buildIDCache{}
+
+const buildIDTTL = 30 * time.Minute
+
+func (b *buildIDCache) Get(forceRefresh bool) (string, error) {
+	b.mu.RLock()
+	stale := forceRefresh || b.id == "" || time.Since(b.fetched) > buildIDTTL
+	current := b.id
+	b.mu.RUnlock()
+	if !stale {
+		return current, nil
+	}
+
+	id, err := fetchBuildID()
+	if err != nil {
+		if current != "" {
+			// Refresh failed but we still have a last-known-good id — use it
+			// rather than fail the whole request.
+			return current, nil
+		}
+		return "", err
+	}
+
+	b.mu.Lock()
+	b.id, b.fetched = id, time.Now()
+	b.mu.Unlock()
+	return id, nil
+}
+
+// fetchBuildID scrapes any edition page's __NEXT_DATA__ blob for the
+// current Next.js buildId.
+func fetchBuildID() (string, error) {
+	req, err := http.NewRequest("GET", config.BaseURL+"/edition/delhi", nil)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to create buildId request")
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "text/html")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", errors.Wrap(err, "buildId request failed")
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to read buildId response")
+	}
+
+	m := buildIDRe.FindSubmatch(body)
+	if m == nil {
+		return "", errors.New("buildId not found in edition page")
+	}
+	return string(m[1]), nil
+}
+
+// =====================================================================
+// Edition data fetching
+// =====================================================================
+
+// GetData fetches the raw Next.js data payload for one edition/date.
+// date must be "YYYY-MM-DD" — the old DD/MM/YYYY format doesn't apply
+// to this endpoint.
+func GetData(date, slug string) ([]byte, error) {
+	id, err := currentBuildID.Get(false)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to resolve buildId")
+	}
+
+	body, status, err := fetchEditionJSON(id, date, slug)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusOK {
+		return body, nil
+	}
+
+	// Most likely a stale buildId after a deploy — refresh once and retry.
+	id, err = currentBuildID.Get(true)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to refresh buildId")
+	}
+	body, status, err = fetchEditionJSON(id, date, slug)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, errors.Errorf("edition request failed with status %d", status)
+	}
+	return body, nil
+}
+
+func fetchEditionJSON(buildID, date, slug string) ([]byte, int, error) {
+	url := fmt.Sprintf("%s/_next/data/%s/edition/%s.json?date=%s&page=1&city=%s",
+		config.BaseURL, buildID, slug, date, slug)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "failed to create new request")
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	req.Header.Set("Referer", config.BaseURL+"/")
+	req.Header.Set("x-nextjs-data", "1")
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "http request failed")
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, errors.Wrap(err, "failed to read response body")
+	}
+	return body, resp.StatusCode, nil
+}
+
+// GetPages parses the Next.js data payload and returns the edition's
+// pages sorted in reading order.
+func GetPages(b []byte) ([]EpaperPage, error) {
+	var nd NextPageData
+	if err := json.Unmarshal(b, &nd); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal JSON")
 	}
-	for _, page := range pages {
-		fmt.Println(page.HrImageUrlJpg)
+	pages := nd.PageProps.Edition.Pages
+	if len(pages) == 0 {
+		return nil, errors.New("no pages found in response")
+	}
+	sort.Slice(pages, func(i, j int) bool { return pages[i].PageNumber < pages[j].PageNumber })
+	for _, p := range pages {
+		fmt.Println(p.ViewerSrc)
 	}
 	return pages, nil
 }
+
+// =====================================================================
+// Image download + PDF assembly
+// =====================================================================
+
+// downloadPageImage downloads a page's viewerSrc (a .webp file) and
+// re-encodes it as PNG, since gopdf can't embed WebP directly.
+func downloadPageImage(url, filename string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create request for %s", url)
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Referer", config.BaseURL+"/")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get image from url %s", url)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return errors.Errorf("http request failed with status %d from url %s", resp.StatusCode, url)
+	}
+
+	img, err := webp.Decode(resp.Body)
+	if err != nil {
+		return errors.Wrapf(err, "failed to decode webp image %s", url)
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create file %s", filename)
+	}
+	defer file.Close()
+
+	if err := png.Encode(file, img); err != nil {
+		return errors.Wrapf(err, "failed to encode png %s", filename)
+	}
+	return nil
+}
+
+func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(pages))
+
+	dir := fmt.Sprintf("./%s-%s", slug, date)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, errors.Wrap(err, "failed to create directory")
+	}
+
+	// Worker pool to cap concurrent downloads at config.MaxDownloads.
+	imageJobs := make(chan struct{}, config.MaxDownloads)
+	filenames := make([]string, len(pages))
+
+	for i, page := range pages {
+		wg.Add(1)
+		go func(i int, page EpaperPage) {
+			defer wg.Done()
+
+			filename := fmt.Sprintf("%s/page_%d.png", dir, i)
+			filenames[i] = filename
+			if _, err := os.Stat(filename); err == nil {
+				fmt.Println("File exists already, skipping download")
+				return
+			}
+
+			imageJobs <- struct{}{}
+			err := downloadPageImage(page.ViewerSrc, filename)
+			<-imageJobs
+
+			if err != nil {
+				errChan <- errors.Wrapf(err, "failed to download page %d", page.PageNumber)
+			}
+		}(i, page)
+	}
+	wg.Wait()
+	close(errChan)
+
+	var combinedErr error
+	for err := range errChan {
+		if combinedErr == nil {
+			combinedErr = err
+		} else {
+			combinedErr = errors.Wrap(combinedErr, err.Error())
+		}
+	}
+	if combinedErr != nil {
+		return nil, combinedErr
+	}
+	return filenames, nil
+}
+
+// CreatePdf builds a single PDF from the downloaded page images, sizing
+// each PDF page to match its source image's own dimensions (now known
+// up front from ViewerWidth/ViewerHeight) so nothing gets clipped or
+// stretched the way the old fixed 1030x1680 page size could.
+func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
+	if _, err := os.Stat(outputFileName); err == nil {
+		fmt.Println("File exists")
+		return nil
+	}
+
+	pdf := gopdf.GoPdf{}
+	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: 1030, H: 1680}})
+
+	for i, imgPath := range imgs {
+		w, h := 1030.0, 1680.0
+		if i < len(pages) && pages[i].ViewerWidth > 0 && pages[i].ViewerHeight > 0 {
+			w = float64(pages[i].ViewerWidth)
+			h = float64(pages[i].ViewerHeight)
+		}
+		pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: w, H: h}})
+		if err := pdf.Image(imgPath, 0, 0, &gopdf.Rect{W: w, H: h}); err != nil {
+			return errors.Wrapf(err, "failed to add image %s", imgPath)
+		}
+	}
+	return pdf.WritePdf(outputFileName)
+}
+
+// =====================================================================
+// HTTP server
+// =====================================================================
 
 func main() {
 	go func() {
@@ -111,8 +523,8 @@ func main() {
 			log.Printf("Health check sent at %v", time.Now().Format(time.RFC3339))
 			time.Sleep(5 * time.Minute)
 		}
-
 	}()
+
 	r := gin.Default()
 	TemplateHttp(r)
 	r.GET("/", TemplateBasic())
@@ -120,33 +532,6 @@ func main() {
 	r.GET("/health", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
-	// r.GET("/env", func(c *gin.Context) {
-	// pass := c.Query("pass")
-	
-	// // Static password check
-	// if pass != "42159" {
-	// 	c.JSON(http.StatusUnauthorized, gin.H{
-	// 		"error": "Invalid password",
-	// 	})
-	// 	return
-	// }
-	
-	// // Get all environment variables
-	// envVars := os.Environ()
-	
-	// // Convert to a more readable map format (optional)
-	// envMap := make(map[string]string)
-	// for _, env := range envVars {
-	// 	parts := strings.SplitN(env, "=", 2)
-	// 	if len(parts) == 2 {
-	// 		envMap[parts[0]] = parts[1]
-	// 	}
-	// }
-	
-	// c.JSON(http.StatusOK, gin.H{
-	// 	"environment_variables": envMap,
-	// })
-})
 	r.Run(":8080")
 }
 
@@ -162,53 +547,46 @@ func TemplateHttp(r *gin.Engine) {
 	r.LoadHTMLFiles(files...)
 	r.StaticFS("/static", http.Dir("./static"))
 
-	// r.GET("ePaper/:edition", func(c *gin.Context) {
-	// 	now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
-	// 	edition := c.Param("edition")
-
-	// 	pdfPath, err := processEpaper(now, edition)
-	// 	if err != nil {
-	// 		c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
-	// 		return
-	// 	}
-
-	// 	c.FileAttachment(pdfPath, pdfPath)
-	// })
-
 	r.GET("ePaper/:edition", func(c *gin.Context) {
-		now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
-
+		date := time.Now().In(time.FixedZone("IST", 19800)).Format("2006-01-02")
+		if qd := c.Query("date"); qd != "" {
+			date = qd
+		}
 		edition := c.Param("edition")
 
-		pdfPath, err := processEpaper(now, edition)
+		pdfPath, err := processEpaper(date, edition)
 		if err != nil {
 			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
 			return
 		}
-
 		c.FileAttachment(pdfPath, pdfPath)
 	})
 }
 
-func processEpaper(now string, edition string) (string, error) {
-	data, err := GetData(now, edition)
+func processEpaper(date, editionInput string) (string, error) {
+	e, err := editions.Resolve(editionInput)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to resolve edition")
+	}
+	slug := e.Slug()
+
+	data, err := GetData(date, slug)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get data")
 	}
-	images, err := GetImages(data)
+	pages, err := GetPages(data)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to get images")
+		return "", errors.Wrap(err, "failed to get pages")
 	}
 
-	filenames, err := DownloadImages(images, edition, now)
+	filenames, err := DownloadImages(pages, slug, date)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to download images")
 	}
 
-	filename := fmt.Sprintf("./%s-%s", edition, strings.Join(strings.Split(now, "/"), "-"))
+	filename := fmt.Sprintf("./%s-%s", slug, date)
 	outputName := fmt.Sprintf("%s.pdf", filename)
-	err = CreatePdf(filenames, outputName)
-	if err != nil {
+	if err := CreatePdf(filenames, pages, outputName); err != nil {
 		return "", errors.Wrap(err, "failed to create PDF")
 	}
 
@@ -222,10 +600,6 @@ type TemplateData struct {
 	Images      []string
 	EditionID   string
 	EditionName string
-}
-
-type TemplateConfig struct {
-	TemplateData
 }
 
 func TemplateBasic() gin.HandlerFunc {
@@ -245,190 +619,46 @@ func TemplateBasic() gin.HandlerFunc {
 	}
 }
 
-var IMAGES = []string{}
-
 func TemplateImages() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		now := time.Now().In(time.FixedZone("IST", 19800)).Format("02/01/2006")
-		edition := c.Param("edition")
+		date := time.Now().In(time.FixedZone("IST", 19800)).Format("2006-01-02")
+		if qd := c.Query("date"); qd != "" {
+			date = qd
+		}
+		editionInput := c.Param("edition")
 
-		data, err := GetData(now, edition)
+		e, err := editions.Resolve(editionInput)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("Unknown edition %q: %v", editionInput, err))
+			return
+		}
+		slug := e.Slug()
+
+		data, err := GetData(date, slug)
 		if err != nil {
 			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
 			return
 		}
-		images, err := GetImages(data)
+		pages, err := GetPages(data)
 		if err != nil {
 			c.String(http.StatusInternalServerError, fmt.Sprintf("Error processing ePaper: %v", err))
 			return
 		}
 
-		imagesString := []string{}
-		for _, image := range images {
-			dURL, err := decryptData(image.HrImageUrlJpg)
-			if err != nil {
-				log.Printf("Error decrypting image URL for page %v", err)
-				return
-			}
-			imagesString = append(imagesString, dURL)
-
+		// viewerSrc is already a plain, directly-viewable URL — no
+		// decryption step is needed to build the gallery any more.
+		imagesString := make([]string, len(pages))
+		for i, page := range pages {
+			imagesString[i] = page.ViewerSrc
 		}
 
 		data2 := TemplateData{
-			// Title:   "Hindustan Epaper Images",
-			EditionName: "edition",
-			EditionID:   edition,
+			EditionName: e.EditionDisplayName,
+			EditionID:   e.EditionCode,
 			Body:        "Here are the images for today's ePaper",
-			Options:     jsondata.AutoGenerated{}, // Adjust as needed
+			Options:     jsondata.AutoGenerated{},
 			Images:      imagesString,
 		}
 		c.HTML(http.StatusOK, "image.html", data2)
 	}
-}
-
-// 1824 × 2958 pixels
-func CreatePdf(imgs []string, outputFileName string) error {
-	if _, err := os.Stat(outputFileName); err == nil {
-		fmt.Println("File exists")
-		return nil
-	}
-	pdf := gopdf.GoPdf{}
-	size := gopdf.Rect{}
-	size.W = 1030
-	size.H = 1680
-	pdf.Start(gopdf.Config{PageSize: size})
-	for _, imgPath := range imgs {
-		pdf.AddPage()
-		err := pdf.Image(imgPath, 2, 0, nil)
-		if err != nil {
-			return errors.Wrapf(err, "failed to add image %s", imgPath)
-		}
-	}
-	return pdf.WritePdf(outputFileName)
-}
-
-func DownloadImages(pages []Page, editionNo, date string) ([]string, error) {
-	var wg sync.WaitGroup
-	var errChan = make(chan error, len(pages))
-
-	dir := fmt.Sprintf("./%s-%s", editionNo, strings.Join(strings.Split(date, "/"), "-"))
-	err := os.MkdirAll(dir, 0755)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create directory")
-	}
-
-	// Create a channel to act as a worker pool.
-	// Buffer the channel to the configured max concurrency
-	imageJobs := make(chan struct{}, config.MaxDownloads)
-
-	// Create a slice to store filenames with the same length as pages
-	filenames := make([]string, len(pages))
-
-	for i, page := range pages {
-		wg.Add(1)
-
-		go func(i int, page Page) {
-			fmt.Println("Downloading image", i)
-			defer wg.Done()
-
-			filename := fmt.Sprintf("%s/page_%d.jpg", dir, i)
-			filenames[i] = filename
-			if _, err := os.Stat(filename); err == nil {
-				fmt.Println("File exists already, skipping download")
-				return
-			}
-			dURL, err := decryptData(page.HrImageUrlJpg)
-			if err != nil {
-				log.Printf("Error decrypting image URL for page %d: %v", i, err)
-				return
-			}
-
-			// Send a job to the worker pool
-			imageJobs <- struct{}{}
-			err = downloadImage(dURL, filename)
-			// Signal to worker pool that the job is done
-			<-imageJobs
-
-			if err != nil {
-				errChan <- errors.Wrapf(err, "failed to download image %s", dURL)
-				return
-			}
-		}(i, page)
-	}
-	wg.Wait()
-	close(errChan)
-	var combinedErr error
-	for err := range errChan {
-		combinedErr = errors.Wrap(combinedErr, err.Error())
-	}
-	if combinedErr != nil {
-		return nil, combinedErr
-	}
-
-	return filenames, nil
-}
-
-func downloadImage(url string, filename string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return errors.Wrapf(err, "failed to get image from url %s", url)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return errors.Errorf("http request failed with status %d from url %s", resp.StatusCode, url)
-	}
-
-	file, err := os.Create(filename)
-	if err != nil {
-		return errors.Wrapf(err, "failed to create file %s", filename)
-	}
-	defer file.Close()
-
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return errors.Wrapf(err, "failed to write file %s", filename)
-	}
-	return nil
-}
-
-func editHighResolution(url string) string {
-	if strings.Contains(url, "_mr") {
-		return strings.Replace(url, "_mr", "", -1)
-	}
-	return url
-}
-
-// PKCS7 unpadding
-func pkcs7Unpad(data []byte) []byte {
-	length := len(data)
-	unpadding := int(data[length-1])
-	return data[:(length - unpadding)]
-}
-
-func decryptData(encryptedText string) (string, error) {
-	secretKey := []byte("abcdefghijklmnop") // 16 bytes
-	iv := []byte("abcdefghijklmnop")        // 16 bytes
-
-	// Decode Base64
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedText)
-	if err != nil {
-		return "", err
-	}
-
-	// Create AES cipher
-	block, err := aes.NewCipher(secretKey)
-	if err != nil {
-		return "", err
-	}
-
-	// CBC mode
-	mode := cipher.NewCBCDecrypter(block, iv)
-
-	// Decrypt
-	mode.CryptBlocks(ciphertext, ciphertext)
-
-	// Remove PKCS7 padding
-	plaintext := pkcs7Unpad(ciphertext)
-
-	return string(plaintext), nil
 }
