@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	_ "image/jpeg" // register JPEG decoding with image.Decode
-	"image/png"
+	"image/jpeg"
+	_ "image/png" // register PNG decoding with image.Decode
 	"io"
 	"log"
 	"net/http"
@@ -29,6 +29,14 @@ import (
 )
 
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+
+// jpegQuality controls the size/quality trade-off for the PDF's embedded
+// page images (1-100). Newspaper scans are photo/text-heavy, so lossless
+// PNG output made these PDFs enormous; JPEG at this quality is visually
+// close to indistinguishable for reading purposes but a fraction of the
+// size. Lower it (e.g. 60-70) for smaller files if 82 still isn't small
+// enough for your needs.
+const jpegQuality = 82
 
 type Config struct {
 	BaseURL      string
@@ -397,8 +405,10 @@ func GetPages(b []byte) ([]EpaperPage, error) {
 // Image download + PDF assembly
 // =====================================================================
 
-// downloadPageImage downloads a page's viewerSrc and re-encodes it as PNG,
-// since gopdf can't embed WebP directly.
+// downloadPageImage downloads a page's viewerSrc and re-encodes it as
+// JPEG, which gopdf embeds efficiently (via DCTDecode, keeping the JPEG
+// compression intact) — PNG was producing enormous PDFs for what is
+// essentially photo/text scan content.
 //
 // The URL always ends in .webp, but the image host does content
 // negotiation off the Accept header — it can hand back JPEG, PNG, WebP,
@@ -456,11 +466,10 @@ func downloadPageImage(url, filename string) error {
 	}
 	_ = format // "webp", "jpeg", or "png" — not needed beyond diagnostics
 
-	// Decoded WebP/JPEG images come back as *image.YCbCr, which Go's PNG
-	// encoder doesn't special-case — it falls back to writing a 16-bit
-	// PNG, which gopdf can't embed ("16-bit depth not supported"). Convert
-	// to a concrete 8-bit RGBA image first so the encoder takes its
-	// normal 8-bit path regardless of the source format/color model.
+	// Decoded images can come back in various color models (YCbCr, NRGBA,
+	// paletted, ...) depending on source format; normalize to a concrete
+	// 8-bit RGBA raster before encoding so the result is consistent
+	// regardless of what was actually downloaded.
 	rgba := image.NewRGBA(img.Bounds())
 	draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
 
@@ -470,8 +479,8 @@ func downloadPageImage(url, filename string) error {
 	}
 	defer file.Close()
 
-	if err := png.Encode(file, rgba); err != nil {
-		return errors.Wrapf(err, "failed to encode png %s", filename)
+	if err := jpeg.Encode(file, rgba, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		return errors.Wrapf(err, "failed to encode jpeg %s", filename)
 	}
 	return nil
 }
@@ -505,7 +514,7 @@ func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
 		go func(i int, page EpaperPage) {
 			defer wg.Done()
 
-			filename := fmt.Sprintf("%s/page_%d.png", dir, i)
+			filename := fmt.Sprintf("%s/page_%d.jpg", dir, i)
 			filenames[i] = filename
 			if _, err := os.Stat(filename); err == nil {
 				fmt.Println("File exists already, skipping download")
