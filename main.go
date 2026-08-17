@@ -547,10 +547,18 @@ func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
 	return filenames, nil
 }
 
+// pdfMarginPt is a blank border added around each page image. The page
+// size used to match the image exactly with zero border, so any viewer
+// or printer that enforces its own non-zero minimum margin ended up
+// clipping a sliver of the actual scan off the edge. ~1cm of margin (the
+// image itself isn't scaled, just given more room on the page) avoids
+// that entirely.
+const pdfMarginPt = 28.35 // ~1cm (72pt/in ÷ 2.54cm/in)
+
 // CreatePdf builds a single PDF from the downloaded page images, sizing
-// each PDF page to match its source image's own dimensions (now known
-// up front from ViewerWidth/ViewerHeight) so nothing gets clipped or
-// stretched the way the old fixed 1030x1680 page size could.
+// each PDF page to its source image's own dimensions (known up front
+// from ViewerWidth/ViewerHeight) plus pdfMarginPt of border on every
+// side, so nothing gets clipped or stretched.
 func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 	if _, err := os.Stat(outputFileName); err == nil {
 		fmt.Println("File exists")
@@ -558,7 +566,10 @@ func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 	}
 
 	pdf := gopdf.GoPdf{}
-	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: 1030, H: 1680}})
+	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{
+		W: 1030 + 2*pdfMarginPt,
+		H: 1680 + 2*pdfMarginPt,
+	}})
 
 	for i, imgPath := range imgs {
 		w, h := 1030.0, 1680.0
@@ -566,8 +577,10 @@ func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 			w = float64(pages[i].ViewerWidth)
 			h = float64(pages[i].ViewerHeight)
 		}
-		pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: w, H: h}})
-		if err := pdf.Image(imgPath, 0, 0, &gopdf.Rect{W: w, H: h}); err != nil {
+		pageW, pageH := w+2*pdfMarginPt, h+2*pdfMarginPt
+
+		pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: pageW, H: pageH}})
+		if err := pdf.Image(imgPath, pdfMarginPt, pdfMarginPt, &gopdf.Rect{W: w, H: h}); err != nil {
 			return errors.Wrapf(err, "failed to add image %s", imgPath)
 		}
 	}
