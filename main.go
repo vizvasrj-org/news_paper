@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	_ "image/jpeg" // register JPEG decoding with image.Decode
-	"image/png"
+	"image/jpeg"
+	_ "image/png" // register PNG decoding with image.Decode
 	"io"
 	"log"
 	"net/http"
@@ -29,6 +29,14 @@ import (
 )
 
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+
+// jpegQuality controls the size/quality trade-off for the PDF's embedded
+// page images (1-100). Newspaper scans are photo/text-heavy, so lossless
+// PNG output made these PDFs enormous; JPEG at this quality is visually
+// close to indistinguishable for reading purposes but a fraction of the
+// size. Lower it (e.g. 60-70) for smaller files if 82 still isn't small
+// enough for your needs.
+const jpegQuality = 82
 
 type Config struct {
 	BaseURL      string
@@ -397,8 +405,10 @@ func GetPages(b []byte) ([]EpaperPage, error) {
 // Image download + PDF assembly
 // =====================================================================
 
-// downloadPageImage downloads a page's viewerSrc and re-encodes it as PNG,
-// since gopdf can't embed WebP directly.
+// downloadPageImage downloads a page's viewerSrc and re-encodes it as
+// JPEG, which gopdf embeds efficiently (via DCTDecode, keeping the JPEG
+// compression intact) — PNG was producing enormous PDFs for what is
+// essentially photo/text scan content.
 //
 // The URL always ends in .webp, but the image host does content
 // negotiation off the Accept header — it can hand back JPEG, PNG, WebP,
@@ -456,11 +466,10 @@ func downloadPageImage(url, filename string) error {
 	}
 	_ = format // "webp", "jpeg", or "png" — not needed beyond diagnostics
 
-	// Decoded WebP/JPEG images come back as *image.YCbCr, which Go's PNG
-	// encoder doesn't special-case — it falls back to writing a 16-bit
-	// PNG, which gopdf can't embed ("16-bit depth not supported"). Convert
-	// to a concrete 8-bit RGBA image first so the encoder takes its
-	// normal 8-bit path regardless of the source format/color model.
+	// Decoded images can come back in various color models (YCbCr, NRGBA,
+	// paletted, ...) depending on source format; normalize to a concrete
+	// 8-bit RGBA raster before encoding so the result is consistent
+	// regardless of what was actually downloaded.
 	rgba := image.NewRGBA(img.Bounds())
 	draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
 
@@ -470,8 +479,8 @@ func downloadPageImage(url, filename string) error {
 	}
 	defer file.Close()
 
-	if err := png.Encode(file, rgba); err != nil {
-		return errors.Wrapf(err, "failed to encode png %s", filename)
+	if err := jpeg.Encode(file, rgba, &jpeg.Options{Quality: jpegQuality}); err != nil {
+		return errors.Wrapf(err, "failed to encode jpeg %s", filename)
 	}
 	return nil
 }
@@ -505,7 +514,7 @@ func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
 		go func(i int, page EpaperPage) {
 			defer wg.Done()
 
-			filename := fmt.Sprintf("%s/page_%d.png", dir, i)
+			filename := fmt.Sprintf("%s/page_%d.jpg", dir, i)
 			filenames[i] = filename
 			if _, err := os.Stat(filename); err == nil {
 				fmt.Println("File exists already, skipping download")
@@ -538,10 +547,18 @@ func DownloadImages(pages []EpaperPage, slug, date string) ([]string, error) {
 	return filenames, nil
 }
 
+// pdfMarginPt is a blank border added around each page image. The page
+// size used to match the image exactly with zero border, so any viewer
+// or printer that enforces its own non-zero minimum margin ended up
+// clipping a sliver of the actual scan off the edge. ~1cm of margin (the
+// image itself isn't scaled, just given more room on the page) avoids
+// that entirely.
+const pdfMarginPt = 28.35 // ~1cm (72pt/in ÷ 2.54cm/in)
+
 // CreatePdf builds a single PDF from the downloaded page images, sizing
-// each PDF page to match its source image's own dimensions (now known
-// up front from ViewerWidth/ViewerHeight) so nothing gets clipped or
-// stretched the way the old fixed 1030x1680 page size could.
+// each PDF page to its source image's own dimensions (known up front
+// from ViewerWidth/ViewerHeight) plus pdfMarginPt of border on every
+// side, so nothing gets clipped or stretched.
 func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 	if _, err := os.Stat(outputFileName); err == nil {
 		fmt.Println("File exists")
@@ -549,7 +566,10 @@ func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 	}
 
 	pdf := gopdf.GoPdf{}
-	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: 1030, H: 1680}})
+	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{
+		W: 1030 + 2*pdfMarginPt,
+		H: 1680 + 2*pdfMarginPt,
+	}})
 
 	for i, imgPath := range imgs {
 		w, h := 1030.0, 1680.0
@@ -557,8 +577,10 @@ func CreatePdf(imgs []string, pages []EpaperPage, outputFileName string) error {
 			w = float64(pages[i].ViewerWidth)
 			h = float64(pages[i].ViewerHeight)
 		}
-		pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: w, H: h}})
-		if err := pdf.Image(imgPath, 0, 0, &gopdf.Rect{W: w, H: h}); err != nil {
+		pageW, pageH := w+2*pdfMarginPt, h+2*pdfMarginPt
+
+		pdf.AddPageWithOption(gopdf.PageOption{PageSize: &gopdf.Rect{W: pageW, H: pageH}})
+		if err := pdf.Image(imgPath, pdfMarginPt, pdfMarginPt, &gopdf.Rect{W: w, H: h}); err != nil {
 			return errors.Wrapf(err, "failed to add image %s", imgPath)
 		}
 	}

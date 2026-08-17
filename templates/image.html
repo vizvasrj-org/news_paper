@@ -1,54 +1,41 @@
 {{ template "global/base" .}}
 
 <body>
-    <style>
-        .redBG {
-            background-color: wheat;
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            justify-content: start;
-            padding: 10px;
-            margin-bottom: 10px;
-            border-radius: 5px;
-            margin-left: 20px;
-
-        }
-        .subHead {
-            margin-left: 20px;
-        }
-        .orgLocation {
-            font-weight: bold;
-            color: darkblue;
-            margin-bottom: 10px;
-        }
-        .seo {
-            font-size: 8px;
-        }
-        .download-btn {
-            
-        }
-    </style>
     {{ template "global/navbar" .}}
 
     <div class="container">
-        <a class="download-btn" href="/ePaper/{{.EditionID}}">Download</a>
+        <a href="/" class="back-link">&larr; सभी संस्करण</a>
 
-        <h1>
-            {{ .Title }}
-        </h1>
+        <div class="gallery-header">
+            <div class="gallery-title">
+                <h1>{{.EditionName}}</h1>
+                <span>{{ len .Images }} पृष्ठ • किसी भी पृष्ठ पर क्लिक करें बड़ा देखने के लिए</span>
+            </div>
+            <a class="btn btn-primary btn-download" href="/ePaper/{{.EditionID}}">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16"/></svg>
+                पीडीएफ़ डाउनलोड करें
+            </a>
+        </div>
 
-        <ul type="1">
+        <div class="page-grid">
             {{range .Images}}
-                <div class="orgLocation">
-                    <img src="{{ . }}" alt="image">
-                </div>
+            <div class="page-card">
+                <span class="page-num"></span>
+                <img src="{{ . }}" alt="अख़बार का पृष्ठ" loading="lazy" decoding="async">
+            </div>
             {{end}}
-        </ul>
-
-        <a class="download-btn" href="/ePaper/{{.EditionID}}">Download</a>
+        </div>
     </div>
-    
+
+    <div class="lightbox" id="lightbox">
+        <button class="lightbox-close" id="lightboxClose" aria-label="बंद करें">✕</button>
+        <button class="lightbox-nav lightbox-prev" id="lightboxPrev" aria-label="पिछला पृष्ठ">‹</button>
+        <img id="lightboxImg" src="" alt="">
+        <button class="lightbox-nav lightbox-next" id="lightboxNext" aria-label="अगला पृष्ठ">›</button>
+        <span class="lightbox-counter" id="lightboxCounter"></span>
+    </div>
+
+    <div class="toast" id="toast"><span class="spin"></span> पीडीएफ़ तैयार हो रही है… इसमें कुछ समय लग सकता है</div>
 
     {{ template "global/footer" .}}
     {{ template "global/js" .}}
